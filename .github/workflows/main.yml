@@ -8,10 +8,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-          architecture: 'x86'
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --windowed --name PDF_Bulk_Renamer pdf_bulk_renamer.py
+      - run: pip install pyinstaller tkinterdnd2
+      - run: pyinstaller --onefile --windowed --name PDF_Bulk_Renamer --icon=icon.ico --collect-all tkinterdnd2 pdf_bulk_renamer.py
       - uses: actions/upload-artifact@v4
         with:
           name: PDF_Bulk_Renamer
           path: dist/PDF_Bulk_Renamer.exe
+
