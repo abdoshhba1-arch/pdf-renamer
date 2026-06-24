@@ -1,612 +1,836 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF Bulk Renamer Pro v2
-=========================
-تطبيق سطح مكتب (Tkinter) لإعادة تسمية ملفات PDF دفعة واحدة بشكل تسلسلي،
-مع مزايا إضافية:
-  1) استبعاد الملفات بالماوس (نقرة/Ctrl+نقرة/Shift+نقرة) بدل كتابة الأسماء.
-  2) زر "تراجع" يرجّع آخر عملية إعادة تسمية.
-  3) نمط تسمية مخصص (بادئة/لاحقة + خيار إضافة التاريخ).
-  4) سحب وإفلات ملفات/مجلدات من مستكشف الملفات مباشرة على نافذة البرنامج
-     (يتطلب مكتبة tkinterdnd2 الخارجية - اختيارية، البرنامج يعمل بدونها أيضًا
-     لكن بدون خاصية السحب والإفلات).
-  5) إعادة ترتيب الملفات يدويًا بالسحب داخل القائمة (يحدد ترتيب الترقيم).
-  8) صندوق بحث/فلترة فوق القائمة.
-
+============================================================================
+ تطبيق إعادة تسمية ملفات PDF الدفعية + الترقيم الفوري التلقائي
+ PDF Batch Renamer + Live Auto-Numbering
+============================================================================
 صُنع بواسطة عبدالله بن أخوك 🙂
+
+يعمل هذا الملف مباشرة عبر:  python app.py
+يعتمد فقط على مكتبة بايثون القياسية، باستثناء tkinterdnd2 (اختيارية)
+لتفعيل خاصية السحب والإفلات من خارج البرنامج. في حال عدم توفرها، يعمل
+البرنامج بكل وظائفه الأخرى بدون أي مشاكل.
+============================================================================
 """
 
 import os
 import re
+import sys
 import shutil
 import uuid
 import threading
+import time
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
-# محاولة استيراد مكتبة السحب والإفلات (اختيارية)
+# ----------------------------------------------------------------------------
+# محاولة استيراد tkinterdnd2 بشكل اختياري (Graceful Fallback)
+# ----------------------------------------------------------------------------
+DND_AVAILABLE = False
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     DND_AVAILABLE = True
-except ImportError:
+except Exception:
     DND_AVAILABLE = False
 
-APP_TITLE = "PDF Abdo"
-CREDIT_TEXT = " 🙂 صُنع بواسطة عبدالله ابن أخوك 🙂"
+ATTRIBUTION_TEXT = "🙂 صُنع بواسطة عبدالله بن أخوك 🙂"
 
-EXCLUDED_BG, EXCLUDED_FG = "#ffd9d9", "#990000"
-NORMAL_BG, NORMAL_FG = "#ffffff", "#000000"
+INVALID_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|]')
 
 
-# --------------------------------------------------------------------------- #
-# دوال مساعدة عامة
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# دوال مساعدة عامة (Helpers)
+# ============================================================================
 
-def get_default_folder() -> str:
-    try:
-        return os.path.dirname(os.path.abspath(__file__))
-    except Exception:
-        return os.getcwd()
+def natural_sort_key(text):
+    """
+    مفتاح فرز طبيعي (Natural Sort) بحيث file2 تسبق file10.
+    يقسّم النص إلى أجزاء رقمية وأجزاء نصية ويحوّل الأرقام لقيم صحيحة للمقارنة.
+    """
+    parts = re.split(r'(\d+)', text)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((1, int(part)))
+        else:
+            key.append((0, part.lower()))
+    return key
 
 
-def natural_sort_key(filename: str):
-    parts = re.split(r'(\d+)', filename)
-    return [int(part) if part.isdigit() else part.lower() for part in parts]
+def sanitize_filename(name):
+    """تنظيف الاسم من الرموز غير المسموحة في أسماء ملفات ويندوز."""
+    cleaned = INVALID_CHARS_PATTERN.sub('_', name)
+    cleaned = cleaned.strip().strip('.')
+    if not cleaned:
+        cleaned = "ملف"
+    return cleaned
 
 
-def list_pdf_files(folder: str):
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"المجلد غير موجود: {folder}")
+def build_name_from_pattern(pattern, n, add_date):
+    """
+    بناء اسم الملف النهائي (بدون الامتداد) بناءً على نمط التسمية المخصص.
+    - يستبدل {n} بالرقم التسلسلي.
+    - إن لم يحتوِ النمط على {n}، نضيف الرقم كنهاية احتياطية لتفادي تكرار الأسماء.
+    - يضيف بادئة التاريخ إن طُلب ذلك.
+    """
+    pattern = pattern.strip() if pattern and pattern.strip() else "{n}"
+    if "{n}" in pattern:
+        base = pattern.replace("{n}", str(n))
+    else:
+        base = f"{pattern}_{n}"
+    base = sanitize_filename(base)
+    if add_date:
+        date_prefix = datetime.now().strftime("%Y-%m-%d_")
+        base = date_prefix + base
+    return base
+
+
+def list_pdf_files(folder):
+    """إرجاع قائمة بأسماء ملفات PDF الموجودة في المجلد (بدون مسارات فرعية)."""
     try:
         entries = os.listdir(folder)
-    except PermissionError:
-        raise PermissionError(f"لا توجد صلاحية كافية للوصول إلى المجلد: {folder}")
-    pdf_files = [
-        f for f in entries
-        if os.path.isfile(os.path.join(folder, f)) and f.lower().endswith(".pdf")
-    ]
-    pdf_files.sort(key=natural_sort_key)
-    return pdf_files
+    except Exception:
+        return []
+    return [f for f in entries if f.lower().endswith(".pdf")
+            and os.path.isfile(os.path.join(folder, f))]
 
 
-def sanitize_filename(name: str) -> str:
-    """يحذف الرموز غير المسموحة في أسماء الملفات على ويندوز."""
-    return re.sub(r'[\\/:*?"<>|]', "_", name)
+def extract_existing_numbers(files):
+    """
+    استخراج الأرقام التسلسلية المستخدمة فعليًا من أسماء ملفات مثل 1.pdf / 12.pdf
+    تُستخدم في تحديد "أول فجوة فاضية" للترقيم الفوري.
+    """
+    numbers = set()
+    for f in files:
+        name, ext = os.path.splitext(f)
+        if ext.lower() == ".pdf" and name.isdigit():
+            numbers.add(int(name))
+    return numbers
 
 
-# --------------------------------------------------------------------------- #
+def first_available_gap(used_numbers, start=1):
+    """إيجاد أول رقم فاضٍ متاح أكبر من أو يساوي start وغير موجود في used_numbers."""
+    n = start
+    while n in used_numbers:
+        n += 1
+    return n
+
+
+def is_file_size_stable(path, wait_seconds=0.5):
+    """
+    فحص استقرار حجم الملف للتأكد أنه لم يكن قيد نسخ/كتابة.
+    يقارن الحجم مرتين بفارق زمني صغير.
+    """
+    try:
+        size1 = os.path.getsize(path)
+    except OSError:
+        return False
+    time.sleep(wait_seconds)
+    try:
+        size2 = os.path.getsize(path)
+    except OSError:
+        return False
+    return size1 == size2
+
+
+def safe_two_phase_move(src, dst):
+    """
+    تنفيذ عملية نقل/إعادة تسمية بخطوتين عبر اسم وسيط مؤقت فريد (UUID)
+    لمنع أي تعارض في حال كانت الأسماء متشابكة (مثل تبديل أسماء ملفات ببعضها).
+    """
+    folder = os.path.dirname(dst) or "."
+    temp_name = os.path.join(folder, f".__tmp_{uuid.uuid4().hex}.pdf")
+    shutil.move(src, temp_name)
+    shutil.move(temp_name, dst)
+
+
+# ============================================================================
+# نافذة المعاينة (Preview Window)
+# ============================================================================
+
+class PreviewWindow(tk.Toplevel):
+    def __init__(self, parent, rename_plan, excluded_files, conflicts):
+        super().__init__(parent)
+        self.title("معاينة عملية إعادة التسمية")
+        self.geometry("650x550")
+
+        tk.Label(self, text="معاينة التغييرات المقترحة", font=("Arial", 13, "bold")).pack(pady=8)
+
+        frame = tk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        tree = ttk.Treeview(frame, columns=("old", "new"), show="headings", height=15)
+        tree.heading("old", text="الاسم الحالي")
+        tree.heading("new", text="الاسم الجديد")
+        tree.column("old", width=280)
+        tree.column("new", width=280)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for old_name, new_name in rename_plan:
+            tree.insert("", "end", values=(old_name, new_name))
+
+        # الملفات المستبعدة
+        tk.Label(self, text="الملفات المستبعدة (لن تتغيّر):", font=("Arial", 10, "bold")).pack(
+            anchor="e", padx=10, pady=(10, 0))
+        excluded_box = tk.Listbox(self, height=5)
+        excluded_box.pack(fill="x", padx=10, pady=(0, 5))
+        for f in excluded_files:
+            excluded_box.insert("end", f)
+        if not excluded_files:
+            excluded_box.insert("end", "(لا يوجد ملفات مستبعدة)")
+
+        # تحذيرات التعارض
+        if conflicts:
+            warn_frame = tk.Frame(self, bg="#ffe5e5")
+            warn_frame.pack(fill="x", padx=10, pady=5)
+            tk.Label(warn_frame, text="⚠ تحذير: تعارضات محتملة في الأسماء:",
+                     bg="#ffe5e5", fg="#a30000", font=("Arial", 10, "bold")).pack(anchor="e", padx=5, pady=2)
+            for c in conflicts:
+                tk.Label(warn_frame, text=f"- {c}", bg="#ffe5e5", fg="#a30000").pack(anchor="e", padx=15)
+
+        tk.Label(self, text=ATTRIBUTION_TEXT, fg="#555").pack(pady=8)
+        tk.Button(self, text="إغلاق", command=self.destroy).pack(pady=5)
+
+
+# ============================================================================
 # التطبيق الرئيسي
-# --------------------------------------------------------------------------- #
+# ============================================================================
 
 class PDFRenamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("740x680")
-        self.root.minsize(620, 560)
+        self.root.title("إعادة تسمية PDF + الترقيم الفوري التلقائي")
+        self.root.geometry("980x720")
 
-        self.folder = get_default_folder()
-        # self.order: الترتيب الحالي لكل الملفات (المرشحة للعرض)، بما فيها المستبعدة
-        self.order = []
-        # self.excluded: مجموعة أسماء الملفات المستبعدة من إعادة التسمية
-        self.excluded = set()
-        # self.file_sources: اسم الملف -> المسار الكامل الحالي على القرص
-        self.file_sources = {}
-        # خريطة: صف ظاهر في القائمة -> فهرس في self.order (تتأثر بالفلترة)
-        self.visible_indices = []
-        # بيانات السحب لإعادة الترتيب
-        self.drag_start_view = None
-        self.last_anchor_view = None
-        # بيانات التراجع: قائمة (المسار بعد إعادة التسمية، المسار الأصلي قبلها)
-        self.last_undo_data = None
+        # ---------------- الحالة الداخلية ----------------
+        self.current_folder = os.getcwd()
+        self.all_files = []          # كل ملفات PDF المكتشفة (ترتيب العرض الحالي)
+        self.excluded = set()        # أسماء الملفات المستبعدة يدويًا
+        self.last_anchor_index = None  # لأجل Shift+Click
+
+        self.last_rename_map = []    # [(new_name, old_name), ...] لإمكانية التراجع
+        self.undo_available = False
+
+        self.manual_operation_lock = threading.Lock()  # لمنع تعارض الخيوط
+        self.live_numbering_active = False
+        self.live_numbering_job = None
+        self.known_files_snapshot = set()  # آخر قائمة ملفات معروفة للمراقبة الفورية
+
+        self.drag_start_index = None
+        self.search_active_filter = ""
 
         self._build_ui()
-        self._scan_folder_async()
+        self._setup_dnd()
+        self.scan_folder()
 
-    # ----------------------------- بناء الواجهة ----------------------------- #
-
+    # ------------------------------------------------------------------
+    # بناء الواجهة
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        # --- شريط المجلد ---
-        top = ttk.Frame(self.root, padding=(10, 10, 10, 4))
-        top.pack(fill="x")
-        ttk.Label(top, text="المجلد الحالي:", font=("Segoe UI", 9, "bold")).pack(side="right")
-        self.folder_var = tk.StringVar(value=self.folder)
-        ttk.Entry(top, textvariable=self.folder_var, justify="right", state="readonly").pack(
-            side="right", fill="x", expand=True, padx=8)
-        ttk.Button(top, text="اختيار مجلد...", command=self.browse_folder).pack(side="right")
+        # ---- شريط المجلد ----
+        top_frame = tk.Frame(self.root)
+        top_frame.pack(fill="x", padx=10, pady=6)
 
-        # --- صندوق البحث/الفلترة (ميزة 8) ---
-        search_frame = ttk.Frame(self.root, padding=(10, 0, 10, 4))
-        search_frame.pack(fill="x")
-        ttk.Label(search_frame, text="بحث:", font=("Segoe UI", 9, "bold")).pack(side="right")
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *a: self._refresh_listbox())
-        ttk.Entry(search_frame, textvariable=self.filter_var, justify="right").pack(
-            side="right", fill="x", expand=True, padx=8)
+        tk.Label(top_frame, text="المجلد الحالي:", font=("Arial", 10, "bold")).pack(side="right", padx=4)
+        self.folder_var = tk.StringVar(value=self.current_folder)
+        tk.Entry(top_frame, textvariable=self.folder_var, state="readonly", justify="right").pack(
+            side="right", fill="x", expand=True, padx=4)
+        tk.Button(top_frame, text="اختيار مجلد آخر", command=self.choose_folder).pack(side="right", padx=4)
+        tk.Button(top_frame, text="تحديث المسح", command=self.scan_folder).pack(side="right", padx=4)
 
-        # --- معلومات وعدد ---
-        info = ttk.Frame(self.root, padding=(10, 0, 10, 2))
-        info.pack(fill="x")
-        self.count_label = ttk.Label(info, text="جاري المسح...", anchor="e", justify="right")
-        self.count_label.pack(fill="x")
+        # ---- صندوق البحث ----
+        search_frame = tk.Frame(self.root)
+        search_frame.pack(fill="x", padx=10, pady=2)
+        tk.Label(search_frame, text="بحث/فلترة:").pack(side="right", padx=4)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self._on_search_change)
+        tk.Entry(search_frame, textvariable=self.search_var, justify="right").pack(
+            side="right", fill="x", expand=True, padx=4)
 
-        hint = ttk.Label(
-            self.root,
-            text="نقرة + سحب = إعادة ترتيب  |  Ctrl+نقرة = استبعاد/تضمين ملف  |  Shift+نقرة = استبعاد نطاق",
-            anchor="e", justify="right", foreground="#555555", font=("Segoe UI", 8, "italic"),
-            padding=(10, 0, 10, 4)
-        )
-        hint.pack(fill="x")
-        if not DND_AVAILABLE:
-            ttk.Label(
-                self.root,
-                text="(السحب والإفلات من مستكشف الملفات غير مفعّل في هذه النسخة)",
-                anchor="e", justify="right", foreground="#aa6600", font=("Segoe UI", 8),
-                padding=(10, 0, 10, 2)
-            ).pack(fill="x")
+        # ---- تلميح الاختصارات ----
+        hint = ("تلميح: نقرة+سحب لإعادة الترتيب | Ctrl+نقرة لاستبعاد/تضمين ملف | "
+                "Shift+نقرة لاستبعاد/تضمين نطاق كامل (السحب والفلترة يتعطلان معًا أثناء البحث)")
+        tk.Label(self.root, text=hint, fg="#0055aa", wraplength=940, justify="right").pack(
+            fill="x", padx=10, pady=(0, 4))
 
-        # --- القائمة ---
-        list_frame = ttk.Frame(self.root, padding=(10, 0, 10, 4))
-        list_frame.pack(fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
-        self.listbox = tk.Listbox(
-            list_frame, selectmode="browse", activestyle="none", exportselection=False,
-            yscrollcommand=scrollbar.set, font=("Consolas", 10), justify="right",
-            bg=NORMAL_BG, fg=NORMAL_FG,
-        )
-        # تحييد لون التحديد الافتراضي بحيث يظهر فقط تلوينُنا الخاص (مستبعد/عادي)
-        self.listbox.configure(selectbackground=NORMAL_BG, selectforeground=NORMAL_FG)
-        scrollbar.config(command=self.listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.listbox.pack(side="right", fill="both", expand=True)
+        # ---- القائمة الرئيسية ----
+        list_frame = tk.Frame(self.root)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
-        self.listbox.bind("<Button-1>", self._on_list_press)
-        self.listbox.bind("<B1-Motion>", self._on_list_drag)
-        self.listbox.bind("<ButtonRelease-1>", self._on_list_release)
+        self.listbox = tk.Listbox(list_frame, selectmode="browse", activestyle="dotbox",
+                                   font=("Arial", 11), height=15, justify="right")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=vsb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
-        # تفعيل السحب والإفلات من مستكشف الملفات إن كانت المكتبة متاحة
-        if DND_AVAILABLE:
-            self.listbox.drop_target_register(DND_FILES)
-            self.listbox.dnd_bind("<<Drop>>", self._on_drop_files)
+        self.listbox.bind("<Button-1>", self._on_listbox_click)
+        self.listbox.bind("<B1-Motion>", self._on_listbox_drag)
+        self.listbox.bind("<ButtonRelease-1>", self._on_listbox_release)
 
-        # --- نمط التسمية (ميزة 3) ---
-        pattern_frame = ttk.LabelFrame(self.root, text="نمط الاسم الجديد", padding=8)
-        pattern_frame.pack(fill="x", padx=10, pady=(0, 4))
+        # ---- قسم نمط الاسم الجديد ----
+        pattern_frame = tk.LabelFrame(self.root, text="نمط الاسم الجديد")
+        pattern_frame.pack(fill="x", padx=10, pady=6)
 
-        row1 = ttk.Frame(pattern_frame)
-        row1.pack(fill="x")
-        ttk.Label(row1, text="استخدم {n} لمكان الرقم التسلسلي:").pack(side="right")
+        tk.Label(pattern_frame, text="النمط (استخدم {n} للرقم التسلسلي):").pack(side="right", padx=4, pady=4)
         self.pattern_var = tk.StringVar(value="{n}")
-        ttk.Entry(row1, textvariable=self.pattern_var, justify="left", width=25).pack(
-            side="right", padx=8)
+        self.pattern_var.trace_add("write", self._update_preview)
+        tk.Entry(pattern_frame, textvariable=self.pattern_var, justify="left", width=25).pack(
+            side="right", padx=4, pady=4)
 
-        row2 = ttk.Frame(pattern_frame)
-        row2.pack(fill="x", pady=(4, 0))
-        self.use_date_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="إضافة التاريخ الحالي كبادئة (YYYY-MM-DD_)",
-                         variable=self.use_date_var).pack(side="right")
-        self.example_label = ttk.Label(row2, text="", foreground="#1a5d1a")
-        self.example_label.pack(side="left")
-        self.pattern_var.trace_add("write", lambda *a: self._update_example())
-        self.use_date_var.trace_add("write", lambda *a: self._update_example())
-        self._update_example()
+        self.add_date_var = tk.BooleanVar(value=False)
+        self.add_date_var.trace_add("write", lambda *a: self._update_preview())
+        tk.Checkbutton(pattern_frame, text="إضافة التاريخ الحالي كبادئة (YYYY-MM-DD_)",
+                        variable=self.add_date_var).pack(side="right", padx=10)
 
-        # --- الأزرار ---
-        btns = ttk.Frame(self.root, padding=(10, 4, 10, 4))
-        btns.pack(fill="x")
-        ttk.Button(btns, text="تحديث المسح", command=self._scan_folder_async).pack(side="right", padx=4)
-        ttk.Button(btns, text="معاينة", command=self.preview_rename).pack(side="right", padx=4)
-        self.rename_btn = ttk.Button(btns, text="تنفيذ إعادة التسمية", command=self.confirm_and_rename)
-        self.rename_btn.pack(side="right", padx=4)
-        self.undo_btn = ttk.Button(btns, text="تراجع عن آخر عملية", command=self.undo_last_rename,
-                                    state="disabled")
-        self.undo_btn.pack(side="right", padx=4)
+        tk.Label(pattern_frame, text="مثال مباشر:").pack(side="right", padx=4)
+        self.preview_label_var = tk.StringVar(value="")
+        tk.Label(pattern_frame, textvariable=self.preview_label_var, fg="#006600",
+                 font=("Arial", 10, "bold")).pack(side="right", padx=4)
 
-        # --- شريط الحالة ---
-        status = ttk.Frame(self.root, padding=(10, 4, 10, 4))
-        status.pack(fill="x")
+        # ---- الأزرار الرئيسية ----
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(fill="x", padx=10, pady=6)
+
+        tk.Button(btn_frame, text="معاينة", width=14, command=self.show_preview).pack(side="right", padx=3)
+        tk.Button(btn_frame, text="تنفيذ إعادة التسمية", width=18, bg="#cce5ff",
+                  command=self.execute_rename).pack(side="right", padx=3)
+        self.undo_btn = tk.Button(btn_frame, text="تراجع عن آخر عملية", width=18,
+                                   command=self.undo_last_rename, state="disabled")
+        self.undo_btn.pack(side="right", padx=3)
+
+        self.live_toggle_btn = tk.Button(btn_frame, text="بدء الترقيم الفوري", width=18,
+                                          bg="#d4f7d4", command=self.toggle_live_numbering)
+        self.live_toggle_btn.pack(side="right", padx=3)
+
+        # ---- مؤشر وسجل الترقيم الفوري ----
+        live_frame = tk.LabelFrame(self.root, text="حالة الترقيم الفوري التلقائي")
+        live_frame.pack(fill="both", padx=10, pady=6)
+
+        status_row = tk.Frame(live_frame)
+        status_row.pack(fill="x")
+        self.live_status_var = tk.StringVar(value="متوقفة")
+        tk.Label(status_row, text="الحالة:").pack(side="right", padx=4)
+        self.live_status_label = tk.Label(status_row, textvariable=self.live_status_var,
+                                           fg="#aa0000", font=("Arial", 10, "bold"))
+        self.live_status_label.pack(side="right", padx=4)
+
+        self.live_log = tk.Listbox(live_frame, height=5, justify="right")
+        self.live_log.pack(fill="x", padx=4, pady=4)
+
+        if not DND_AVAILABLE:
+            tk.Label(self.root, text="ملاحظة: مكتبة tkinterdnd2 غير مثبتة، لذلك خاصية السحب والإفلات "
+                                      "من مستكشف الملفات غير مفعّلة في هذه النسخة (باقي الميزات تعمل بشكل كامل).",
+                     fg="#aa6600", wraplength=940, justify="right").pack(fill="x", padx=10, pady=2)
+
+        # ---- شريط الحالة السفلي ----
         self.status_var = tk.StringVar(value="جاهز.")
-        ttk.Label(status, textvariable=self.status_var, anchor="e", justify="right",
-                  foreground="#1a5d1a", font=("Segoe UI", 9, "bold")).pack(fill="x")
+        status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1, relief="sunken",
+                               anchor="e", justify="right")
+        status_bar.pack(fill="x", side="bottom")
 
-        ttk.Label(self.root, text=CREDIT_TEXT, anchor="center",
-                  font=("Segoe UI", 9, "italic"), foreground="#666666").pack(fill="x", pady=(0, 6))
+        tk.Label(self.root, text=ATTRIBUTION_TEXT, fg="#555").pack(side="bottom", pady=3)
 
-    def _update_example(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------
+    # السحب والإفلات الخارجي (tkinterdnd2)
+    # ------------------------------------------------------------------
+    def _setup_dnd(self):
+        if not DND_AVAILABLE:
+            return
         try:
-            example = self._compute_new_name(self.pattern_var.get(), 1, self.use_date_var.get())
-            self.example_label.config(text=f"مثال: {example}")
+            self.listbox.drop_target_register(DND_FILES)
+            self.listbox.dnd_bind("<<Drop>>", self._on_external_drop)
         except Exception:
-            self.example_label.config(text="")
+            pass
 
-    # ----------------------------- المسح ----------------------------- #
+    def _on_external_drop(self, event):
+        """التعامل مع إفلات ملفات/مجلدات من خارج البرنامج."""
+        try:
+            raw_paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            raw_paths = [event.data]
 
-    def browse_folder(self):
-        chosen = filedialog.askdirectory(initialdir=self.folder, title="اختر مجلدًا يحتوي على ملفات PDF")
-        if chosen:
-            self.folder = chosen
-            self.folder_var.set(self.folder)
-            self._scan_folder_async()
+        added_any = False
+        for path in raw_paths:
+            path = path.strip("{}")
+            if os.path.isdir(path):
+                for f in list_pdf_files(path):
+                    src = os.path.join(path, f)
+                    dst = os.path.join(self.current_folder, f)
+                    if self._safe_copy_external(src, dst):
+                        added_any = True
+            elif os.path.isfile(path) and path.lower().endswith(".pdf"):
+                dst = os.path.join(self.current_folder, os.path.basename(path))
+                if self._safe_copy_external(path, dst):
+                    added_any = True
 
-    def _scan_folder_async(self):
-        self.status_var.set("جاري المسح عن ملفات PDF...")
-        self.rename_btn.config(state="disabled")
+        if added_any:
+            self.set_status("تم إضافة ملف/ملفات مسحوبة من خارج البرنامج.")
+            self.scan_folder()
+        else:
+            self.set_status("لم تتم إضافة أي ملفات (قد تكون موجودة بالفعل أو غير PDF).")
+
+    def _safe_copy_external(self, src, dst):
+        """نقل ملف خارجي إلى المجلد الحالي باستخدام shutil.move بأمان."""
+        try:
+            if os.path.abspath(src) == os.path.abspath(dst):
+                return False
+            if os.path.exists(dst):
+                base, ext = os.path.splitext(os.path.basename(dst))
+                dst = os.path.join(self.current_folder, f"{base}_{uuid.uuid4().hex[:6]}{ext}")
+            shutil.move(src, dst)
+            return True
+        except Exception as e:
+            self.set_status(f"خطأ أثناء نقل ملف مسحوب: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # اختيار المجلد ومسحه
+    # ------------------------------------------------------------------
+    def choose_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.current_folder)
+        if folder:
+            self.current_folder = folder
+            self.folder_var.set(folder)
+            self.scan_folder()
+
+    def scan_folder(self):
+        """مسح المجلد في خيط منفصل لتجنب تجميد الواجهة."""
+        self.set_status("جاري مسح المجلد...")
         threading.Thread(target=self._scan_folder_worker, daemon=True).start()
 
     def _scan_folder_worker(self):
         try:
-            files = list_pdf_files(self.folder)
-            error = None
+            files = list_pdf_files(self.current_folder)
+            files_sorted = sorted(files, key=natural_sort_key)
         except Exception as e:
-            files = []
-            error = str(e)
-        self.root.after(0, lambda: self._scan_folder_done(files, error))
-
-    def _scan_folder_done(self, files, error):
-        self.order = list(files)
-        self.excluded = set()
-        self.file_sources = {f: os.path.join(self.folder, f) for f in files}
-        self.filter_var.set("")
-        self._refresh_listbox()
-        self.rename_btn.config(state="normal")
-
-        if error:
-            messagebox.showerror("خطأ في المسح", error)
-            self.status_var.set("فشل المسح.")
-            self.count_label.config(text="تعذر مسح المجلد.")
+            self.root.after(0, lambda: self.set_status(f"خطأ أثناء المسح: {e}"))
             return
+        self.root.after(0, lambda: self._apply_scan_result(files_sorted))
 
-        if not self.order:
-            self.status_var.set("لا توجد ملفات PDF في هذا المجلد.")
-            self.count_label.config(text="0 ملف PDF تم العثور عليه.")
-        else:
-            self.status_var.set("تم المسح بنجاح.")
-            self.count_label.config(text=f"تم العثور على {len(self.order)} ملف PDF.")
+    def _apply_scan_result(self, files_sorted):
+        self.all_files = files_sorted
+        # تنظيف المستبعدة من ملفات غير موجودة بعد
+        self.excluded = {f for f in self.excluded if f in self.all_files}
+        self.known_files_snapshot = set(self.all_files)
+        self._refresh_listbox()
+        self.set_status(f"تم العثور على {len(self.all_files)} ملف PDF.")
 
-    # ----------------------------- العرض والتلوين ----------------------------- #
-
+    # ------------------------------------------------------------------
+    # عرض القائمة + الفلترة
+    # ------------------------------------------------------------------
     def _refresh_listbox(self):
-        filt = self.filter_var.get().strip().lower()
         self.listbox.delete(0, "end")
-        self.visible_indices = []
-        for i, fname in enumerate(self.order):
-            if filt and filt not in fname.lower():
+        query = self.search_var.get().strip().lower()
+        self.search_active_filter = query
+        for f in self.all_files:
+            if query and query not in f.lower():
                 continue
-            self.visible_indices.append(i)
-            self.listbox.insert("end", fname)
-            row = self.listbox.size() - 1
-            if fname in self.excluded:
-                self.listbox.itemconfig(row, {"bg": EXCLUDED_BG, "fg": EXCLUDED_FG})
+            self.listbox.insert("end", f)
+        self._repaint_colors()
+        self._update_preview()
+
+    def _repaint_colors(self):
+        for i in range(self.listbox.size()):
+            name = self.listbox.get(i)
+            if name in self.excluded:
+                self.listbox.itemconfig(i, bg="#ffcccc", fg="#660000")
             else:
-                self.listbox.itemconfig(row, {"bg": NORMAL_BG, "fg": NORMAL_FG})
+                self.listbox.itemconfig(i, bg="white", fg="black")
 
-    # ----------------------------- التفاعل بالماوس (ميزة 1 و 5) ----------------------------- #
-
-    def _on_list_press(self, event):
-        view_idx = self.listbox.nearest(event.y)
-        if view_idx < 0 or view_idx >= len(self.visible_indices):
-            return "break"
-
-        ctrl = bool(event.state & 0x4)
-        shift = bool(event.state & 0x1)
-
-        if ctrl:
-            self._toggle_exclude(view_idx)
-            self.last_anchor_view = view_idx
-            self.drag_start_view = None
-            return "break"
-
-        if shift and self.last_anchor_view is not None:
-            self._toggle_exclude_range(self.last_anchor_view, view_idx)
-            self.drag_start_view = None
-            return "break"
-
-        # بدون أي مفتاح إضافي: ابدأ سحب لإعادة الترتيب (فقط إذا لا يوجد فلتر نشط)
-        self.last_anchor_view = view_idx
-        if self.filter_var.get().strip():
-            self.drag_start_view = None
-        else:
-            self.drag_start_view = view_idx
-        return "break"
-
-    def _on_list_drag(self, event):
-        if self.drag_start_view is None:
-            return "break"
-        view_idx = self.listbox.nearest(event.y)
-        if view_idx == self.drag_start_view or view_idx < 0 or view_idx >= len(self.order):
-            return "break"
-        # بدون فلتر نشط: الفهرس الظاهر = الفهرس الحقيقي في self.order
-        fname = self.order.pop(self.drag_start_view)
-        self.order.insert(view_idx, fname)
-        self.drag_start_view = view_idx
-        self._refresh_listbox()
-        return "break"
-
-    def _on_list_release(self, event):
-        self.drag_start_view = None
-        return "break"
-
-    def _toggle_exclude(self, view_idx):
-        real_idx = self.visible_indices[view_idx]
-        fname = self.order[real_idx]
-        if fname in self.excluded:
-            self.excluded.discard(fname)
-        else:
-            self.excluded.add(fname)
+    def _on_search_change(self, *args):
         self._refresh_listbox()
 
-    def _toggle_exclude_range(self, view_a, view_b):
-        lo, hi = sorted((view_a, view_b))
-        # نحدد الحالة الهدف بناءً على الملف عند نقطة النقر الجديدة
-        target_real = self.visible_indices[view_b]
-        target_fname = self.order[target_real]
-        make_excluded = target_fname not in self.excluded
-        for v in range(lo, hi + 1):
-            real_idx = self.visible_indices[v]
-            fname = self.order[real_idx]
-            if make_excluded:
-                self.excluded.add(fname)
+    def _is_filtering_active(self):
+        return bool(self.search_var.get().strip())
+
+    # ------------------------------------------------------------------
+    # تفاعلات الماوس على القائمة: استبعاد / سحب وترتيب
+    # ------------------------------------------------------------------
+    def _on_listbox_click(self, event):
+        index = self.listbox.nearest(event.y)
+        if index < 0 or index >= self.listbox.size():
+            return
+
+        ctrl_pressed = bool(event.state & 0x0004)
+        shift_pressed = bool(event.state & 0x0001)
+
+        if ctrl_pressed:
+            self._toggle_exclude(index)
+            self.last_anchor_index = index
+            return "break"
+        elif shift_pressed and self.last_anchor_index is not None:
+            self._toggle_exclude_range(self.last_anchor_index, index)
+            return "break"
+        else:
+            self.last_anchor_index = index
+            # تحضير للسحب فقط إن لم تكن الفلترة مفعّلة
+            if not self._is_filtering_active():
+                self.drag_start_index = index
             else:
-                self.excluded.discard(fname)
-        self._refresh_listbox()
+                self.drag_start_index = None
 
-    # ----------------------------- السحب والإفلات من الإكسبلورر (ميزة 4) ----------------------------- #
+    def _on_listbox_drag(self, event):
+        if self.drag_start_index is None or self._is_filtering_active():
+            return
+        new_index = self.listbox.nearest(event.y)
+        if new_index < 0 or new_index >= self.listbox.size():
+            return
+        if new_index != self.drag_start_index:
+            name = self.listbox.get(self.drag_start_index)
+            self.listbox.delete(self.drag_start_index)
+            self.listbox.insert(new_index, name)
+            self._repaint_colors()
+            self.drag_start_index = new_index
+            self._sync_all_files_order_from_listbox()
+            self._update_preview()
 
-    def _on_drop_files(self, event):
-        try:
-            paths = self.root.tk.splitlist(event.data)
-        except Exception:
-            paths = []
+    def _on_listbox_release(self, event):
+        self.drag_start_index = None
 
-        added = 0
-        for p in paths:
-            p = p.strip("{}")  # ويندوز يضيف أقواس حول المسارات التي فيها مسافات
-            if os.path.isdir(p):
-                try:
-                    for f in list_pdf_files(p):
-                        if self._add_dropped_file(os.path.join(p, f)):
-                            added += 1
-                except Exception:
-                    pass
-            elif os.path.isfile(p) and p.lower().endswith(".pdf"):
-                if self._add_dropped_file(p):
-                    added += 1
+    def _sync_all_files_order_from_listbox(self):
+        """مزامنة ترتيب all_files مع الترتيب الحالي المعروض في القائمة (عند عدم وجود فلترة)."""
+        if self._is_filtering_active():
+            return
+        self.all_files = [self.listbox.get(i) for i in range(self.listbox.size())]
 
-        if added:
-            self._refresh_listbox()
-            self.count_label.config(text=f"تم العثور على {len(self.order)} ملف PDF.")
-            self.status_var.set(f"تمت إضافة {added} ملف عن طريق السحب والإفلات.")
+    def _toggle_exclude(self, index):
+        name = self.listbox.get(index)
+        if name in self.excluded:
+            self.excluded.discard(name)
         else:
-            self.status_var.set("لم يتم العثور على ملفات PDF صالحة في العناصر المسحوبة.")
+            self.excluded.add(name)
+        self._repaint_colors()
+        self._update_preview()
 
-    def _add_dropped_file(self, full_path: str) -> bool:
-        fname = os.path.basename(full_path)
-        if fname in self.order:
-            return False  # تجاهل التكرار بنفس الاسم
-        self.order.append(fname)
-        self.file_sources[fname] = full_path
-        return True
+    def _toggle_exclude_range(self, start, end):
+        lo, hi = sorted((start, end))
+        names = [self.listbox.get(i) for i in range(lo, hi + 1)]
+        # إن كانت أغلب العناصر مستبعدة، نقوم بتضمينها جميعًا، وإلا نستبعدها جميعًا
+        excluded_count = sum(1 for n in names if n in self.excluded)
+        should_exclude = excluded_count < len(names) / 2
+        for n in names:
+            if should_exclude:
+                self.excluded.add(n)
+            else:
+                self.excluded.discard(n)
+        self._repaint_colors()
+        self._update_preview()
 
-    # ----------------------------- حساب الاسم الجديد ----------------------------- #
-
-    def _compute_new_name(self, pattern: str, n: int, use_date: bool) -> str:
-        pattern = pattern if pattern.strip() else "{n}"
-        base = pattern if "{n}" in pattern else pattern + "{n}"
-        name = base.replace("{n}", str(n))
-        name = re.sub(r"\.pdf$", "", name, flags=re.IGNORECASE)
-        name = sanitize_filename(name)
-        if use_date:
-            name = datetime.now().strftime("%Y-%m-%d_") + name
-        return name + ".pdf"
-
-    def _compute_mapping(self):
-        remaining = [f for f in self.order if f not in self.excluded]
+    # ------------------------------------------------------------------
+    # حساب خطة إعادة التسمية والمعاينة المباشرة
+    # ------------------------------------------------------------------
+    def _compute_rename_plan(self):
+        """
+        يحسب خطة إعادة التسمية بناءً على ترتيب القائمة الحالي (all_files)
+        مع تجاهل الملفات المستبعدة. يعيد قائمة [(old_name, new_name), ...]
+        """
         pattern = self.pattern_var.get()
-        use_date = self.use_date_var.get()
-        mapping = []
-        for idx, old in enumerate(remaining, start=1):
-            new = self._compute_new_name(pattern, idx, use_date)
-            mapping.append((old, new))
-        return mapping
+        add_date = self.add_date_var.get()
+        plan = []
+        n = 1
+        for f in self.all_files:
+            if f in self.excluded:
+                continue
+            new_base = build_name_from_pattern(pattern, n, add_date)
+            new_name = new_base + ".pdf"
+            plan.append((f, new_name))
+            n += 1
+        return plan
 
-    def _find_conflicts(self, mapping):
-        excluded_lower = {n.lower() for n in self.excluded}
-        return [new for _, new in mapping if new.lower() in excluded_lower]
+    def _detect_conflicts(self, plan):
+        """التحقق من تعارض أي اسم جديد مع اسم ملف مستبعد موجود فعليًا، أو تكرار أسماء جديدة."""
+        conflicts = []
+        new_names = [new for _, new in plan]
+        excluded_names = self.excluded
 
-    # ----------------------------- المعاينة ----------------------------- #
+        seen = {}
+        for old, new in plan:
+            seen.setdefault(new, []).append(old)
+        for new, olds in seen.items():
+            if len(olds) > 1:
+                conflicts.append(f"تكرار الاسم الجديد '{new}' لأكثر من ملف: {', '.join(olds)}")
 
-    def preview_rename(self):
-        if not self.order:
-            messagebox.showinfo(APP_TITLE, "لا توجد ملفات PDF لمعاينتها.")
-            return
+        for new in new_names:
+            if new in excluded_names:
+                conflicts.append(f"الاسم الجديد المقترح '{new}' يتطابق مع اسم ملف مستبعد موجود فعليًا!")
+        return conflicts
 
-        mapping = self._compute_mapping()
-        conflicts = self._find_conflicts(mapping)
-
-        win = tk.Toplevel(self.root)
-        win.title("معاينة إعادة التسمية")
-        win.geometry("520x480")
-        win.transient(self.root)
-
-        ttk.Label(win, text="معاينة العملية", font=("Segoe UI", 11, "bold"), anchor="center").pack(
-            fill="x", pady=(10, 5))
-
-        text = tk.Text(win, wrap="word", font=("Consolas", 10))
-        text.pack(fill="both", expand=True, padx=12, pady=6)
-        text.tag_configure("right", justify="right")
-
-        text.insert("end", "── الملفات التي ستُعاد تسميتها (بترتيبها الحالي) ──\n", "right")
-        if mapping:
-            for old, new in mapping:
-                text.insert("end", f"{old}   →   {new}\n", "right")
-        else:
-            text.insert("end", "(لا توجد ملفات لإعادة تسميتها)\n", "right")
-
-        text.insert("end", "\n── الملفات المستبعدة (لن تتغير) ──\n", "right")
-        if self.excluded:
-            for name in sorted(self.excluded, key=natural_sort_key):
-                text.insert("end", f"{name}\n", "right")
-        else:
-            text.insert("end", "(لا توجد ملفات مستبعدة)\n", "right")
-
-        if conflicts:
-            text.insert("end", "\n⚠ تعارض: الأسماء الجديدة التالية تتطابق مع ملفات مستبعدة:\n", "right")
-            for c in conflicts:
-                text.insert("end", f"{c}\n", "right")
-
-        text.config(state="disabled")
-        ttk.Button(win, text="إغلاق", command=win.destroy).pack(pady=8)
-
-    # ----------------------------- التنفيذ ----------------------------- #
-
-    def confirm_and_rename(self):
-        if not self.order:
-            messagebox.showinfo(APP_TITLE, "لا توجد ملفات PDF لإعادة تسميتها.")
-            return
-
-        mapping = self._compute_mapping()
-        if not mapping:
-            messagebox.showinfo(APP_TITLE, "جميع الملفات مستبعدة، لا يوجد ما يتم إعادة تسميته.")
-            return
-
-        conflicts = self._find_conflicts(mapping)
-        if conflicts:
-            messagebox.showerror(
-                APP_TITLE,
-                "تعذر إعادة التسمية بسبب تعارض الأسماء مع ملفات مستبعدة:\n" + "\n".join(conflicts)
-            )
-            return
-
-        confirmed = messagebox.askyesno(
-            APP_TITLE,
-            f"سيتم إعادة تسمية {len(mapping)} ملف PDF.\n"
-            f"عدد الملفات المستبعدة (لن تتغير): {len(self.excluded)}\n\n"
-            "هل تريد المتابعة؟ (تقدر تستخدم زر 'تراجع' بعد التنفيذ لو غيرت رأيك)"
-        )
-        if not confirmed:
-            return
-
-        self.rename_btn.config(state="disabled")
-        self.undo_btn.config(state="disabled")
-        self.status_var.set("جاري إعادة التسمية...")
-        threading.Thread(target=self._rename_worker, args=(mapping,), daemon=True).start()
-
-    def _rename_worker(self, mapping):
-        renamed_count = 0
-        errors = []
-        undo_data = []  # (المسار النهائي بعد إعادة التسمية، المسار الأصلي قبلها)
-
+    def _update_preview(self, *args):
         try:
-            temp_map = []  # (مسار مؤقت, اسم جديد نهائي, مسار أصلي قديم)
-            for old, new in mapping:
-                src = self.file_sources.get(old, os.path.join(self.folder, old))
-                if not os.path.isfile(src):
-                    errors.append(f"الملف غير موجود: {old}")
-                    continue
-                old_basename = os.path.basename(src)
-                if old_basename == new:
-                    renamed_count += 1
-                    undo_data.append((src, src))
-                    continue
-                temp_name = f"~tmp_{uuid.uuid4().hex}.pdf"
-                temp_path = os.path.join(self.folder, temp_name)
-                shutil.move(src, temp_path)
-                temp_map.append((temp_path, new, src))
+            sample_name = build_name_from_pattern(self.pattern_var.get(), 1, self.add_date_var.get())
+            self.preview_label_var.set(sample_name + ".pdf")
+        except Exception:
+            self.preview_label_var.set("(نمط غير صالح)")
 
-            for temp_path, new, original_src in temp_map:
-                final_path = os.path.join(self.folder, new)
-                shutil.move(temp_path, final_path)
-                renamed_count += 1
-                undo_data.append((final_path, original_src))
+    # ------------------------------------------------------------------
+    # نافذة المعاينة الكاملة
+    # ------------------------------------------------------------------
+    def show_preview(self):
+        if not self.all_files:
+            messagebox.showinfo("معاينة", "لا توجد ملفات PDF لمعاينتها.")
+            return
+        plan = self._compute_rename_plan()
+        conflicts = self._detect_conflicts(plan)
+        excluded_list = sorted([f for f in self.all_files if f in self.excluded], key=natural_sort_key)
+        PreviewWindow(self.root, plan, excluded_list, conflicts)
 
-        except PermissionError as e:
-            errors.append(f"خطأ في الأذونات: {e}")
-        except FileNotFoundError as e:
-            errors.append(f"ملف غير موجود: {e}")
-        except OSError as e:
-            errors.append(f"خطأ في نظام الملفات: {e}")
-        except Exception as e:
-            errors.append(f"خطأ غير متوقع: {e}")
+    # ------------------------------------------------------------------
+    # تنفيذ إعادة التسمية الفعلية
+    # ------------------------------------------------------------------
+    def execute_rename(self):
+        if not self.all_files:
+            messagebox.showinfo("تنبيه", "لا توجد ملفات PDF لإعادة تسميتها.")
+            return
 
-        self.root.after(0, lambda: self._rename_done(renamed_count, errors, undo_data))
+        plan = self._compute_rename_plan()
+        if not plan:
+            messagebox.showinfo("تنبيه", "كل الملفات مستبعدة حاليًا، لا يوجد ما يُعاد تسميته.")
+            return
 
-    def _rename_done(self, renamed_count, errors, undo_data):
-        self.rename_btn.config(state="normal")
+        conflicts = self._detect_conflicts(plan)
+        if conflicts:
+            msg = "توجد تعارضات في الأسماء:\n" + "\n".join(conflicts) + "\n\nهل تريد المتابعة رغم ذلك؟"
+            if not messagebox.askyesno("تحذير تعارض", msg):
+                return
 
-        if errors:
-            messagebox.showerror(APP_TITLE, "حدثت أخطاء خلال إعادة التسمية:\n" + "\n".join(errors))
-            self.status_var.set("اكتملت العملية مع وجود أخطاء.")
-        else:
-            messagebox.showinfo(
-                APP_TITLE,
-                f"تمت العملية بنجاح ✅\n\n"
-                f"عدد الملفات التي أُعيدت تسميتها: {renamed_count}\n"
-                f"عدد الملفات المستبعدة (دون تغيير): {len(self.excluded)}"
-            )
-            self.status_var.set(f"تم! {renamed_count} ملف أُعيد تسميته.")
+        if not messagebox.askyesno("تأكيد", f"سيتم إعادة تسمية {len(plan)} ملف. هل تريد المتابعة؟"):
+            return
 
-        if undo_data:
-            self.last_undo_data = undo_data
-            self.undo_btn.config(state="normal")
+        self.set_status("جاري تنفيذ إعادة التسمية...")
+        threading.Thread(target=self._execute_rename_worker, args=(plan,), daemon=True).start()
 
-        self._scan_folder_async()
+    def _execute_rename_worker(self, plan):
+        # إيقاف الترقيم الفوري مؤقتًا لمنع تعارض الوصول لنفس الملفات
+        with self.manual_operation_lock:
+            errors = []
+            successful_map = []  # [(new_name, old_name)]
+            try:
+                for old_name, new_name in plan:
+                    old_path = os.path.join(self.current_folder, old_name)
+                    new_path = os.path.join(self.current_folder, new_name)
+                    if not os.path.exists(old_path):
+                        errors.append(f"الملف '{old_name}' غير موجود (تم تجاوزه).")
+                        continue
+                    try:
+                        if old_path == new_path:
+                            successful_map.append((new_name, old_name))
+                            continue
+                        safe_two_phase_move(old_path, new_path)
+                        successful_map.append((new_name, old_name))
+                    except PermissionError:
+                        errors.append(f"لا توجد صلاحية كافية لإعادة تسمية '{old_name}'.")
+                    except FileNotFoundError:
+                        errors.append(f"الملف '{old_name}' لم يُعثر عليه أثناء التنفيذ.")
+                    except Exception as e:
+                        errors.append(f"خطأ غير متوقع مع '{old_name}': {e}")
+            except Exception as e:
+                errors.append(f"خطأ عام أثناء إعادة التسمية: {e}")
 
-    # ----------------------------- التراجع (ميزة 2) ----------------------------- #
+        self.last_rename_map = successful_map
+        self.undo_available = len(successful_map) > 0
 
+        def finish():
+            self.undo_btn.config(state=("normal" if self.undo_available else "disabled"))
+            if errors:
+                messagebox.showwarning("اكتمل مع وجود أخطاء", "\n".join(errors))
+            self.set_status(f"تمت إعادة تسمية {len(successful_map)} ملف بنجاح.")
+            self.scan_folder()
+
+        self.root.after(0, finish)
+
+    # ------------------------------------------------------------------
+    # التراجع عن آخر عملية
+    # ------------------------------------------------------------------
     def undo_last_rename(self):
-        if not self.last_undo_data:
-            messagebox.showinfo(APP_TITLE, "لا توجد عملية سابقة للتراجع عنها.")
+        if not self.undo_available or not self.last_rename_map:
+            messagebox.showinfo("تنبيه", "لا توجد عملية سابقة للتراجع عنها.")
             return
-
-        confirmed = messagebox.askyesno(
-            APP_TITLE, "هل تريد التراجع عن آخر عملية إعادة تسمية وإرجاع الأسماء الأصلية؟"
-        )
-        if not confirmed:
+        if not messagebox.askyesno("تأكيد التراجع", "هل تريد التراجع عن آخر عملية إعادة تسمية؟"):
             return
+        self.set_status("جاري التراجع عن آخر عملية...")
+        threading.Thread(target=self._undo_worker, daemon=True).start()
 
-        self.undo_btn.config(state="disabled")
-        self.status_var.set("جاري التراجع...")
-        threading.Thread(target=self._undo_worker, args=(self.last_undo_data,), daemon=True).start()
-
-    def _undo_worker(self, undo_data):
-        restored = 0
-        errors = []
-        try:
-            temp_map = []
-            for current_path, original_path in undo_data:
-                if current_path == original_path or not os.path.isfile(current_path):
+    def _undo_worker(self):
+        with self.manual_operation_lock:
+            errors = []
+            for new_name, old_name in self.last_rename_map:
+                new_path = os.path.join(self.current_folder, new_name)
+                old_path = os.path.join(self.current_folder, old_name)
+                if not os.path.exists(new_path):
+                    errors.append(f"تعذّر العثور على '{new_name}' للتراجع.")
                     continue
-                temp_name = f"~tmp_{uuid.uuid4().hex}.pdf"
-                temp_path = os.path.join(os.path.dirname(current_path), temp_name)
-                shutil.move(current_path, temp_path)
-                temp_map.append((temp_path, original_path))
+                try:
+                    if new_path == old_path:
+                        continue
+                    safe_two_phase_move(new_path, old_path)
+                except Exception as e:
+                    errors.append(f"خطأ أثناء التراجع عن '{new_name}': {e}")
 
-            for temp_path, original_path in temp_map:
-                os.makedirs(os.path.dirname(original_path), exist_ok=True)
-                shutil.move(temp_path, original_path)
-                restored += 1
-        except Exception as e:
-            errors.append(f"خطأ خلال التراجع: {e}")
+        def finish():
+            self.last_rename_map = []
+            self.undo_available = False
+            self.undo_btn.config(state="disabled")
+            if errors:
+                messagebox.showwarning("اكتمل التراجع مع أخطاء", "\n".join(errors))
+            self.set_status("تم التراجع عن آخر عملية إعادة تسمية.")
+            self.scan_folder()
 
-        self.root.after(0, lambda: self._undo_done(restored, errors))
+        self.root.after(0, finish)
 
-    def _undo_done(self, restored, errors):
-        self.last_undo_data = None
-        if errors:
-            messagebox.showerror(APP_TITLE, "\n".join(errors))
-            self.status_var.set("التراجع اكتمل مع وجود أخطاء.")
+    # ------------------------------------------------------------------
+    # الترقيم الفوري التلقائي (Live Auto-Numbering)
+    # ------------------------------------------------------------------
+    def toggle_live_numbering(self):
+        if self.live_numbering_active:
+            self._stop_live_numbering()
         else:
-            messagebox.showinfo(APP_TITLE, f"تم التراجع بنجاح، تمت استعادة {restored} ملف لاسمه الأصلي.")
-            self.status_var.set("تم التراجع بنجاح.")
-        self._scan_folder_async()
+            self._start_live_numbering()
+
+    def _start_live_numbering(self):
+        self.live_numbering_active = True
+        self.live_status_var.set("نشطة الآن")
+        self.live_status_label.config(fg="#007700")
+        self.live_toggle_btn.config(text="إيقاف الترقيم الفوري", bg="#ffd9b3")
+        # أخذ لقطة حالية لتفادي اعتبار الملفات الموجودة "جديدة"
+        self.known_files_snapshot = set(list_pdf_files(self.current_folder))
+        self._schedule_live_check()
+        self._log_live(f"تم تفعيل الترقيم الفوري في {datetime.now().strftime('%H:%M:%S')}")
+
+    def _stop_live_numbering(self):
+        self.live_numbering_active = False
+        self.live_status_var.set("متوقفة")
+        self.live_status_label.config(fg="#aa0000")
+        self.live_toggle_btn.config(text="بدء الترقيم الفوري", bg="#d4f7d4")
+        if self.live_numbering_job is not None:
+            try:
+                self.root.after_cancel(self.live_numbering_job)
+            except Exception:
+                pass
+            self.live_numbering_job = None
+        self._log_live(f"تم إيقاف الترقيم الفوري في {datetime.now().strftime('%H:%M:%S')}")
+
+    def _schedule_live_check(self):
+        """جدولة دورة فحص جديدة كل 1.5 ثانية تقريبًا باستخدام root.after (دون أي مكتبة خارجية)."""
+        if not self.live_numbering_active:
+            return
+        # تنفيذ الفحص الفعلي في خيط منفصل لتجنب تجميد الواجهة، ثم العودة للحلقة الرئيسية
+        threading.Thread(target=self._live_check_worker, daemon=True).start()
+        self.live_numbering_job = self.root.after(1500, self._schedule_live_check)
+
+    def _live_check_worker(self):
+        """
+        دورة فحص واحدة: تكتشف الملفات الجديدة وتُرقّمها فوريًا.
+        لا تُحترَم قائمة الاستبعاد اليدوية هنا حسب المواصفات.
+        """
+        # تجنّب التعارض مع عملية يدوية جارية (إعادة تسمية / تراجع)
+        if not self.manual_operation_lock.acquire(blocking=False):
+            return
+        try:
+            current_files = set(list_pdf_files(self.current_folder))
+            new_files = current_files - self.known_files_snapshot
+            if not new_files:
+                self.known_files_snapshot = current_files
+                return
+
+            # ترتيب الملفات الجديدة بحسب وقت التعديل (افتراض عملي لترتيب "وقت الإضافة الفعلي")
+            # ملاحظة: لا توجد طريقة مضمونة 100% لمعرفة لحظة "ظهور" الملف بدقة عبر Polling البسيط،
+            # لذلك نعتمد على وقت آخر تعديل (mtime) كأقرب تقدير عملي لترتيب الدخول.
+            def mtime_safe(fname):
+                try:
+                    return os.path.getmtime(os.path.join(self.current_folder, fname))
+                except OSError:
+                    return 0
+
+            new_files_sorted = sorted(new_files, key=mtime_safe)
+
+            for fname in new_files_sorted:
+                full_path = os.path.join(self.current_folder, fname)
+                if not os.path.exists(full_path):
+                    continue
+                # التحقق من استقرار حجم الملف (ليس قيد نسخ/تحميل)
+                if not is_file_size_stable(full_path, wait_seconds=0.5):
+                    # سيُعاد فحصه في الدورة التالية لأنه لم يُحدَّث في known_files_snapshot
+                    continue
+                self._rename_new_file_live(fname)
+                # تحديث اللقطة فورًا بعد كل ملف لمنع إعادة معالجته
+                self.known_files_snapshot.add(fname)
+
+            # تحديث اللقطة الكاملة في النهاية لاستيعاب أي ملفات لم تُرقَّم بعد (لا تزال قيد النسخ)
+            stable_known = set(self.known_files_snapshot)
+            self.known_files_snapshot = (current_files - new_files) | stable_known
+
+        except Exception as e:
+            self.root.after(0, lambda: self.set_status(f"خطأ في الترقيم الفوري: {e}"))
+        finally:
+            self.manual_operation_lock.release()
+
+    def _rename_new_file_live(self, fname):
+        """إعادة تسمية ملف جديد مكتشف وفق أول رقم فاضٍ متاح، مع تطبيق نمط التسمية المخصص."""
+        try:
+            existing_files = list_pdf_files(self.current_folder)
+            used_numbers = extract_existing_numbers(existing_files)
+            n = first_available_gap(used_numbers, start=1)
+
+            pattern = self.pattern_var.get()
+            add_date = self.add_date_var.get()
+            new_base = build_name_from_pattern(pattern, n, add_date)
+            new_name = new_base + ".pdf"
+
+            old_path = os.path.join(self.current_folder, fname)
+            new_path = os.path.join(self.current_folder, new_name)
+
+            if not os.path.exists(old_path):
+                return
+            if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(old_path):
+                # تجنّب الكتابة فوق ملف موجود فعليًا: نبحث عن رقم آخر فاضٍ
+                used_numbers.add(n)
+                n = first_available_gap(used_numbers, start=n + 1)
+                new_base = build_name_from_pattern(pattern, n, add_date)
+                new_name = new_base + ".pdf"
+                new_path = os.path.join(self.current_folder, new_name)
+
+            safe_two_phase_move(old_path, new_path)
+
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            self.root.after(0, lambda: self._log_live(f"[{timestamp}] تمت إعادة تسمية '{fname}' → '{new_name}'"))
+            self.root.after(0, self.scan_folder)
+        except Exception as e:
+            self.root.after(0, lambda: self._log_live(f"خطأ أثناء ترقيم '{fname}': {e}"))
+
+    def _log_live(self, message):
+        self.live_log.insert(0, message)
+        if self.live_log.size() > 50:
+            self.live_log.delete(50, "end")
+
+    # ------------------------------------------------------------------
+    # أدوات عامة
+    # ------------------------------------------------------------------
+    def set_status(self, message):
+        self.status_var.set(message)
+
+    def _on_close(self):
+        # إيقاف الترقيم الفوري بالكامل عند إغلاق البرنامج (لا أثر متبقٍ)
+        self.live_numbering_active = False
+        if self.live_numbering_job is not None:
+            try:
+                self.root.after_cancel(self.live_numbering_job)
+            except Exception:
+                pass
+        self.root.destroy()
 
 
-# --------------------------------------------------------------------------- #
-# نقطة الدخول
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# نقطة تشغيل البرنامج
+# ============================================================================
 
 def main():
     if DND_AVAILABLE:
@@ -615,17 +839,14 @@ def main():
         root = tk.Tk()
 
     try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-    except Exception:
-        pass
+        app = PDFRenamerApp(root)
+    except Exception as e:
+        messagebox.showerror("خطأ فادح", f"حدث خطأ أثناء تشغيل البرنامج:\n{e}")
+        sys.exit(1)
 
-    PDFRenamerApp(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
+
